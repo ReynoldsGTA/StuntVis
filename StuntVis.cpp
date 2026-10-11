@@ -1,8 +1,12 @@
 // StuntVis: stand-alone stunt visualisation for GTA SA and GTA VC (plugin-sdk).
-//   K - toggle the predicted flight path (drawn while no wheel touches the ground)
-//   U - toggle collision spheres of tracked vehicles
-//   N - toggle collision boxes of tracked vehicles
-//   M - toggle collision spheres + boxes of the vehicle you are driving (independent of U/N)
+//   K - toggle the predicted flight path (drawn while no wheel touches the ground);
+//       hold K and press + / - to change its line thickness (1-10)
+//   U - toggle collision spheres of tracked vehicles;
+//       hold U and press + / - to change the opacity of all collision drawing (10-100%),
+//       U+S to switch spheres/boxes between wireframe and solid,
+//       U+D to switch the depth test of collision drawing on/off
+//   N - toggle collision boxes + collision mesh (triangles) of tracked vehicles
+//   M - toggle collision spheres, boxes and mesh of the vehicle you are driving (independent of U/N)
 //   J - track / untrack a vehicle: the one you are in, or else the nearest one (20 m).
 //   G - select / deselect the world objects your vehicle (or you, on foot) is standing on
 //       or touching, and show their collision (spheres, boxes, triangle mesh). Press G
@@ -27,6 +31,7 @@
 #include "CBuilding.h"
 #include "CObject.h"
 #include "cHandlingDataMgr.h"
+#include "CCamera.h"
 #ifdef GTASA
 #include "CCollisionData.h"
 #else
@@ -102,7 +107,7 @@ CColModel* getColModel(CEntity* e)
 // drew last (a texture, vertex alpha, fog), which can make them fade or vanish.
 struct DebugRenderState {
     RwUInt32 raster = 0, vertexAlpha = 0, zWrite = 0, zTest = 0, fog = 0, srcBlend = 0, dstBlend = 0;
-    RwUInt32 lighting = 0;
+    RwUInt32 lighting = 0, cullMode = 0;
     static constexpr RwUInt32 D3DRS_LIGHTING_ = 137; // same value in D3D8 and D3D9
 
     DebugRenderState() {
@@ -113,15 +118,17 @@ struct DebugRenderState {
         RwRenderStateGet(rwRENDERSTATEFOGENABLE, &fog);
         RwRenderStateGet(rwRENDERSTATESRCBLEND, &srcBlend);
         RwRenderStateGet(rwRENDERSTATEDESTBLEND, &dstBlend);
+        RwRenderStateGet(rwRENDERSTATECULLMODE, &cullMode);
 
         RwRenderStateSet(rwRENDERSTATETEXTURERASTER, nullptr);
-        RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
+        RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE); // collision opacity setting
         // No depth test/write: the debug lines are always drawn in front of the world.
         RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
         RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
         RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
         RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
         RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
+        RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE); // thick lines are two-sided quads
 
         // Models are drawn with D3D lighting on; if it is still on, the line colour comes
         // from the scene lighting instead of the vertex colour (light/dark shifts).
@@ -147,6 +154,7 @@ struct DebugRenderState {
         RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)(uintptr_t)fog);
         RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)(uintptr_t)srcBlend);
         RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)(uintptr_t)dstBlend);
+        RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)(uintptr_t)cullMode);
     }
 };
 
@@ -232,36 +240,114 @@ void collectColSpheres(CEntity* v, std::vector<Sphere>& out)
     }
 }
 
-void drawSphere(const CVector& center, float radius, int segments = 8, int rings = 8)
+// Unit-sphere wireframe (latitude rings + longitude lines) as line-list endpoints,
+// computed once; every sphere is this template scaled and moved.
+const std::vector<CVector>& unitSphereLines()
 {
-    const float PI = 3.14159265358979323846f;
-    std::vector<RwIm3DVertex> v;
-    v.reserve(rings * segments * 4);
+    static std::vector<CVector> lines;
+    if (lines.empty()) {
+        constexpr int SEGMENTS = 8, RINGS = 8;
+        const float PI = 3.14159265358979323846f;
+        auto point = [PI, RINGS, SEGMENTS](int ring, int seg) {
+            const float phi = PI * ring / RINGS, theta = 2.0f * PI * seg / SEGMENTS;
+            return CVector(sinf(phi) * cosf(theta), sinf(phi) * sinf(theta), cosf(phi));
+        };
+        for (int i = 1; i < RINGS; ++i)
+            for (int j = 0; j < SEGMENTS; ++j) {
+                lines.push_back(point(i, j));
+                lines.push_back(point(i, j + 1));
+            }
+        for (int j = 0; j < SEGMENTS; ++j)
+            for (int i = 0; i < RINGS; ++i) {
+                lines.push_back(point(i, j));
+                lines.push_back(point(i + 1, j));
+            }
+    }
+    return lines;
+}
 
-    auto addLine = [&](const CVector& a, const CVector& b) {
-        RwIm3DVertex p{}, q{};
-        RwIm3DVertexSetPos(&p, a.x, a.y, a.z);
-        RwIm3DVertexSetPos(&q, b.x, b.y, b.z);
-        RwIm3DVertexSetRGBA(&p, 0, 255, 0, 255);
-        RwIm3DVertexSetRGBA(&q, 0, 255, 0, 255);
-        v.push_back(p);
-        v.push_back(q);
-    };
-    auto point = [&](float phi, float theta) {
-        return CVector(center.x + radius * sinf(phi) * cosf(theta),
-                       center.y + radius * sinf(phi) * sinf(theta),
-                       center.z + radius * cosf(phi));
-    };
+// Appends a wireframe sphere to a line-list batch.
+void appendSphere(std::vector<RwIm3DVertex>& out, const CVector& center, float radius)
+{
+    for (const CVector& u : unitSphereLines()) {
+        RwIm3DVertex v{};
+        RwIm3DVertexSetPos(&v, center.x + radius * u.x, center.y + radius * u.y, center.z + radius * u.z);
+        RwIm3DVertexSetRGBA(&v, 0, 255, 0, 255);
+        out.push_back(v);
+    }
+}
 
-    for (int i = 1; i < rings; ++i)
-        for (int j = 0; j < segments; ++j)
-            addLine(point(PI * i / rings, 2 * PI * j / segments), point(PI * i / rings, 2 * PI * (j + 1) / segments));
+// Collision drawing style (U+S / U+D).
+bool g_collisionSolid = false;      // solid shaded spheres/boxes instead of wireframes
+bool g_collisionDepthTest = false;  // hide collision behind world geometry
 
-    for (int j = 0; j < segments; ++j)
-        for (int i = 0; i < rings; ++i)
-            addLine(point(PI * i / rings, 2 * PI * j / segments), point(PI * (i + 1) / rings, 2 * PI * j / segments));
+// Solid shapes are wound counter-clockwise when seen from outside (in GTA's right-handed,
+// z-up world), and the GPU culls the back faces. If a game/driver ends up showing only
+// the inside (back) halves, switch this to rwCULLMODECULLFRONT.
+const RwCullMode kSolidCullMode = rwCULLMODECULLBACK;
 
-    renderIm3D(v.data(), static_cast<int>(v.size()), rwPRIMTYPELINELIST);
+inline CVector crossProduct(const CVector& u, const CVector& v)
+{
+    return CVector(u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x);
+}
+
+// Fixed light for the solid shading (normalised (0.3, 0.4, 0.866)).
+const CVector kLightDir(0.3f, 0.4f, 0.866f);
+
+float shadeFor(const CVector& n)
+{
+    const float d = n.x * kLightDir.x + n.y * kLightDir.y + n.z * kLightDir.z;
+    return 0.45f + 0.55f * (d > 0.0f ? d : 0.0f);
+}
+
+void pushVertex(std::vector<RwIm3DVertex>& out, const CVector& p, int r, int g, int b, float shade)
+{
+    RwIm3DVertex v{};
+    RwIm3DVertexSetPos(&v, p.x, p.y, p.z);
+    RwIm3DVertexSetRGBA(&v, static_cast<RwUInt8>(r * shade), static_cast<RwUInt8>(g * shade),
+                        static_cast<RwUInt8>(b * shade), 255);
+    out.push_back(v);
+}
+
+// Unit-sphere triangle list (8 rings x 12 segments), computed once. On a unit sphere the
+// position is also the normal, so the shading comes straight from it.
+const std::vector<CVector>& unitSphereTriangles()
+{
+    static std::vector<CVector> tris;
+    if (tris.empty()) {
+        constexpr int SEGMENTS = 12, RINGS = 8;
+        const float PI = 3.14159265358979323846f;
+        auto point = [PI, SEGMENTS, RINGS](int ring, int seg) {
+            const float phi = PI * ring / RINGS, theta = 2.0f * PI * seg / SEGMENTS;
+            return CVector(sinf(phi) * cosf(theta), sinf(phi) * sinf(theta), cosf(phi));
+        };
+        // Emit a triangle wound counter-clockwise seen from outside (normal along the
+        // centroid direction); degenerate triangles at the poles are skipped.
+        auto emit = [](const CVector& a, const CVector& b, const CVector& c) {
+            const CVector n = crossProduct(b - a, c - a);
+            const CVector centroid = a + b + c;
+            const float facing = n.x * centroid.x + n.y * centroid.y + n.z * centroid.z;
+            if (facing == 0.0f)
+                return;
+            tris.push_back(a);
+            if (facing > 0.0f) { tris.push_back(b); tris.push_back(c); }
+            else               { tris.push_back(c); tris.push_back(b); }
+        };
+        for (int i = 0; i < RINGS; ++i)
+            for (int j = 0; j < SEGMENTS; ++j) {
+                const CVector a = point(i, j), b = point(i + 1, j), c = point(i + 1, j + 1), d = point(i, j + 1);
+                emit(a, b, c);
+                emit(a, c, d);
+            }
+    }
+    return tris;
+}
+
+// Appends a solid, shaded sphere to a triangle-list batch (back faces are culled on the GPU).
+void appendSolidSphere(std::vector<RwIm3DVertex>& out, const CVector& center, float radius)
+{
+    for (const CVector& u : unitSphereTriangles())
+        pushVertex(out, center + u * radius, 0, 255, 0, shadeFor(u));
 }
 
 // ---- Collision boxes ---------------------------------------------------------
@@ -314,7 +400,8 @@ void collectColBoxes(CEntity* v, std::vector<Box>& out)
     }
 }
 
-void drawBox(const Box& box)
+// Appends a box's 12 edges to a line-list batch.
+void appendBox(std::vector<RwIm3DVertex>& out, const Box& box)
 {
     // The 12 edges: corners differing in exactly one bit.
     static const int edges[12][2] = {
@@ -323,15 +410,47 @@ void drawBox(const Box& box)
         {0,4},{1,5},{2,6},{3,7},   // along z
     };
 
-    RwIm3DVertex v[24]{};
     for (int e = 0; e < 12; ++e) {
         for (int k = 0; k < 2; ++k) {
             const CVector& p = box.corners[edges[e][k]];
-            RwIm3DVertexSetPos(&v[e * 2 + k], p.x, p.y, p.z);
-            RwIm3DVertexSetRGBA(&v[e * 2 + k], 0, 160, 255, 255);
+            RwIm3DVertex v{};
+            RwIm3DVertexSetPos(&v, p.x, p.y, p.z);
+            RwIm3DVertexSetRGBA(&v, 0, 160, 255, 255);
+            out.push_back(v);
         }
     }
-    renderIm3D(v, 24, rwPRIMTYPELINELIST);
+}
+
+// Appends a solid, shaded box (6 faces, 2 triangles each) to a triangle-list batch, each
+// face wound counter-clockwise seen from outside (back faces are culled on the GPU).
+void appendSolidBox(std::vector<RwIm3DVertex>& out, const Box& box)
+{
+    // Faces as corner indices (bit 1 = max x, 2 = max y, 4 = max z), wound consistently.
+    static const int faces[6][4] = {
+        {0,2,6,4}, {1,5,7,3},   // -x, +x
+        {0,4,5,1}, {2,3,7,6},   // -y, +y
+        {0,1,3,2}, {4,6,7,5},   // -z, +z
+    };
+    const CVector centre = (box.corners[0] + box.corners[7]) * 0.5f;
+    for (const auto& f : faces) {
+        const CVector& a = box.corners[f[0]];
+        const CVector& c = box.corners[f[2]];
+        const CVector* b = &box.corners[f[1]];
+        const CVector* d = &box.corners[f[3]];
+        CVector n = crossProduct(*b - a, *d - a);
+        const float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+        if (len > 1e-6f) n = n * (1.0f / len);
+        // Reverse the face if it is wound inwards (depends on the entity's matrix), so it is
+        // always counter-clockwise seen from outside.
+        const CVector fc = (a + c) * 0.5f - centre;
+        if (n.x * fc.x + n.y * fc.y + n.z * fc.z < 0.0f) {
+            std::swap(b, d);
+            n = n * -1.0f;
+        }
+        const float s = shadeFor(n);
+        pushVertex(out, a, 0, 160, 255, s); pushVertex(out, *b, 0, 160, 255, s); pushVertex(out, c, 0, 160, 255, s);
+        pushVertex(out, a, 0, 160, 255, s); pushVertex(out, c, 0, 160, 255, s); pushVertex(out, *d, 0, 160, 255, s);
+    }
 }
 
 // ---- Collision triangle meshes -----------------------------------------------
@@ -388,10 +507,34 @@ void collectColTriangles(CEntity* e, std::vector<RwIm3DVertex>& out, size_t maxT
     }
 }
 
+// Opacity of collision wireframes in steps of 10% (1..10).
+int g_collisionOpacity = 10;
+constexpr int MAX_COLLISION_OPACITY = 10;
+
+// Sets the alpha of every vertex (D3D colour is ARGB: alpha in the top byte).
+void applyAlpha(std::vector<RwIm3DVertex>& verts, int opacityStep)
+{
+    if (opacityStep >= MAX_COLLISION_OPACITY)
+        return;  // vertices are created fully opaque
+    const RwUInt32 a = static_cast<RwUInt32>(opacityStep * 255 / MAX_COLLISION_OPACITY) << 24;
+    for (RwIm3DVertex& v : verts)
+        v.color = (v.color & 0x00FFFFFF) | a;
+}
+
+// Draws a long triangle list in chunks (30000 is a multiple of 3).
+void drawTriList(std::vector<RwIm3DVertex>& verts)
+{
+    constexpr size_t CHUNK = 30000;
+    for (size_t i = 0; i < verts.size(); i += CHUNK) {
+        const size_t n = (verts.size() - i) < CHUNK ? (verts.size() - i) : CHUNK;
+        renderIm3D(verts.data() + i, static_cast<int>(n), rwPRIMTYPETRILIST);
+    }
+}
+
 // Draws a long line list in chunks (RenderWare's immediate mode takes at most 65535 vertices).
 void drawLineList(std::vector<RwIm3DVertex>& verts)
 {
-    constexpr size_t CHUNK = 6000; // even, so lines are never split
+    constexpr size_t CHUNK = 30000; // even, so lines are never split; well below the 65535 limit
     for (size_t i = 0; i < verts.size(); i += CHUNK) {
         const size_t n = (verts.size() - i) < CHUNK ? (verts.size() - i) : CHUNK;
         renderIm3D(verts.data() + i, static_cast<int>(n), rwPRIMTYPELINELIST);
@@ -402,7 +545,15 @@ void drawLineList(std::vector<RwIm3DVertex>& verts)
 
 struct SelectedObject {
     CEntity* entity;
-    int modelIndex; // guards against the pool slot being reused by another entity
+    int modelIndex;    // guards against the pool slot being reused by another entity
+    bool isBuilding;   // buildings never move: their geometry is cached once
+
+    // World-space collision geometry, cached so it stays visible when the game streams the
+    // collision out (or deletes and later recreates an object) as you move away.
+    bool cached = false;
+    std::vector<RwIm3DVertex> lines;
+    std::vector<Sphere> spheres;
+    std::vector<Box> boxes;
 };
 
 // True if the pointer is still a live building/object of the same model.
@@ -489,30 +640,94 @@ void computeTrajectory(CVehicle* v, std::vector<CVector>& points, bool& hitsGrou
     }
 }
 
+// Trajectory line thickness in (approximate) pixels; 1 = plain 1-pixel lines.
+int g_trajectoryWidth = 1;
+constexpr int MAX_TRAJECTORY_WIDTH = 10;
+
+CVector cameraPosition()
+{
+#ifdef GTASA
+    return TheCamera.GetPosition();
+#else
+    return TheCamera.pos;
+#endif
+}
+
+// Appends segment a-b as a camera-facing quad (two triangles) of about 'px' pixels wide.
+// The width grows with distance to the camera so it stays roughly constant on screen
+// (0.0013 ~ 2*tan(35 deg)/1080: one pixel at 1 m for a typical FOV and 1080p).
+void addThickSegment(std::vector<RwIm3DVertex>& out, const CVector& a, const CVector& b,
+                     const CVector& cam, float px, RwUInt8 r, RwUInt8 g, RwUInt8 bl)
+{
+    auto cross = [](const CVector& u, const CVector& v) {
+        return CVector(u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x);
+    };
+    auto length = [](const CVector& v) { return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z); };
+
+    const CVector dir = b - a;
+    CVector side = cross(dir, cam - (a + b) * 0.5f);
+    const float len = length(side);
+    if (len < 1e-6f)
+        return;  // segment points straight at the camera
+    side = side * (1.0f / len);
+
+    const float k = 0.5f * px * 0.0013f;
+    const CVector oa = side * (k * length(cam - a));
+    const CVector ob = side * (k * length(cam - b));
+    const CVector corners[6] = { a + oa, a - oa, b + ob, b + ob, a - oa, b - ob };
+    for (const CVector& p : corners) {
+        RwIm3DVertex v{};
+        RwIm3DVertexSetPos(&v, p.x, p.y, p.z);
+        RwIm3DVertexSetRGBA(&v, r, g, bl, 255);
+        out.push_back(v);
+    }
+}
+
 void drawTrajectory(const std::vector<CVector>& points, bool hitsGround)
 {
     if (points.size() < 2)
         return;
 
-    std::vector<RwIm3DVertex> v(points.size());
-    for (size_t i = 0; i < points.size(); ++i) {
-        RwIm3DVertexSetPos(&v[i], points[i].x, points[i].y, points[i].z);
-        RwIm3DVertexSetRGBA(&v[i], 255, 200, 0, 255);
-    }
-    renderIm3D(v.data(), static_cast<int>(v.size()), rwPRIMTYPEPOLYLINE);
-
+    CVector cross[4];
     if (hitsGround) {
         const CVector& l = points.back();
         const float s = 1.0f;
-        RwIm3DVertex cross[4]{};
-        RwIm3DVertexSetPos(&cross[0], l.x - s, l.y, l.z + 0.1f);
-        RwIm3DVertexSetPos(&cross[1], l.x + s, l.y, l.z + 0.1f);
-        RwIm3DVertexSetPos(&cross[2], l.x, l.y - s, l.z + 0.1f);
-        RwIm3DVertexSetPos(&cross[3], l.x, l.y + s, l.z + 0.1f);
-        for (auto& c : cross)
-            RwIm3DVertexSetRGBA(&c, 255, 0, 0, 255);
-        renderIm3D(cross, 4, rwPRIMTYPELINELIST);
+        cross[0] = CVector(l.x - s, l.y, l.z + 0.1f);
+        cross[1] = CVector(l.x + s, l.y, l.z + 0.1f);
+        cross[2] = CVector(l.x, l.y - s, l.z + 0.1f);
+        cross[3] = CVector(l.x, l.y + s, l.z + 0.1f);
     }
+
+    if (g_trajectoryWidth <= 1) {
+        std::vector<RwIm3DVertex> v(points.size());
+        for (size_t i = 0; i < points.size(); ++i) {
+            RwIm3DVertexSetPos(&v[i], points[i].x, points[i].y, points[i].z);
+            RwIm3DVertexSetRGBA(&v[i], 255, 200, 0, 255);
+        }
+        renderIm3D(v.data(), static_cast<int>(v.size()), rwPRIMTYPEPOLYLINE);
+
+        if (hitsGround) {
+            RwIm3DVertex c[4]{};
+            for (int i = 0; i < 4; ++i) {
+                RwIm3DVertexSetPos(&c[i], cross[i].x, cross[i].y, cross[i].z);
+                RwIm3DVertexSetRGBA(&c[i], 255, 0, 0, 255);
+            }
+            renderIm3D(c, 4, rwPRIMTYPELINELIST);
+        }
+        return;
+    }
+
+    const CVector cam = cameraPosition();
+    const float px = static_cast<float>(g_trajectoryWidth);
+    std::vector<RwIm3DVertex> tris;
+    tris.reserve(points.size() * 6 + 12);
+    for (size_t i = 1; i < points.size(); ++i)
+        addThickSegment(tris, points[i - 1], points[i], cam, px, 255, 200, 0);
+    if (hitsGround) {
+        addThickSegment(tris, cross[0], cross[1], cam, px, 255, 0, 0);
+        addThickSegment(tris, cross[2], cross[3], cam, px, 255, 0, 0);
+    }
+    renderIm3D(tris.data(), static_cast<int>(tris.size()), rwPRIMTYPETRILIST);
 }
 
 // ---- Handling check ----------------------------------------------------------
@@ -537,6 +752,9 @@ struct HandlingReport {
     int vehicle = 0;  // 1-based index of the vehicle being checked
     int field = 0;    // 1-based index of the field being checked
     std::vector<int> codes;
+#ifdef _DEBUG
+    std::string debug;  // actual vs expected values; debug builds only
+#endif
 };
 
 void fail(HandlingReport& r)
@@ -549,15 +767,27 @@ void compareF(HandlingReport& r, float actual, float expected)
 {
     ++r.field;
     const float tol = 1e-4f * (fabsf(expected) > 1.0f ? fabsf(expected) : 1.0f);
-    if (fabsf(actual - expected) > tol)
+    if (fabsf(actual - expected) > tol) {
         fail(r);
+#ifdef _DEBUG
+        char s[64];
+        snprintf(s, sizeof(s), " [%04d: %g != %g]", r.codes.back(), actual, expected);
+        r.debug += s;
+#endif
+    }
 }
 
 void compareU(HandlingReport& r, unsigned actual, unsigned expected)
 {
     ++r.field;
-    if (actual != expected)
+    if (actual != expected) {
         fail(r);
+#ifdef _DEBUG
+        char s[64];
+        snprintf(s, sizeof(s), " [%04d: 0x%X != 0x%X]", r.codes.back(), actual, expected);
+        r.debug += s;
+#endif
+    }
 }
 
 #ifdef GTASA
@@ -681,6 +911,7 @@ struct HandlingRef {
     unsigned monetary;
     float suspUpper, suspLower, suspBias, suspAntiDive;
     unsigned flags, frontLights, rearLights;
+    unsigned flagsAlt;  // second accepted flags value (0 = none), e.g. the LC mod for VC
 };
 
 // Flags are hexadecimal in handling.cfg. Values checked against the handling.cfg of a
@@ -690,7 +921,8 @@ const HandlingRef kHandlingRefs[] = {
     { "INFERNUS", 1600.0f, 2.0f, 4.4f, 1.3f, 0.0f, 0.0f, -0.3f, 70, 0.95f, 0.80f, 0.52f, 0.52f, 0, 30.0f,
       1.8f, 0.19f, 0.37f, 0.72f, 95000, 0.25f, -0.17f, 0.5f, 0.4f, 0x1208182, 1, 1 },
     { "PACKER",   8000.0f, 2.9f, 8.0f, 3.6f, 0.0f, 0.0f, 0.0f, 90, 0.65f, 0.85f, 0.35f, 0.35f, 0, 30.0f,
-      1.5f, 0.04f, 0.56f, 0.40f, 20000, 0.45f, -0.25f, 0.5f, 0.0f, 0x8000, 0, 1 },
+      1.5f, 0.04f, 0.56f, 0.40f, 20000, 0.45f, -0.25f, 0.5f, 0.0f, 0x8000, 0, 1,
+      0x8100 },  // LC mod: PACKER flags 8100 (adds DBL_EXHAUST, visual only)
     { "BIKE",     500.0f, 0.8f, 1.8f, 1.2f, 0.0f, 0.05f, -0.09f, 103, 1.6f, 0.9f, 0.48f, 0.50f, 0, 35.0f,
       0.85f, 0.15f, 0.3f, 0.15f, 10000, 0.15f, -0.16f, 0.5f, 0.0f, 0x10102, 1, 1 },
 };
@@ -720,7 +952,7 @@ void checkVehicle(HandlingReport& r, const HandlingRef& e, const tHandlingData& 
     compareF(r, h.fSuspLowerLimit, e.suspLower);
     compareF(r, h.fSuspBias, e.suspBias);
     compareF(r, h.fSuspAntiDiveMultiplier, e.suspAntiDive);
-    compareU(r, h.uFlags, e.flags);
+    compareU(r, (e.flagsAlt && h.uFlags == e.flagsAlt) ? e.flags : h.uFlags, e.flags);
     compareU(r, static_cast<unsigned>(h.bFrontLights), e.frontLights);
     compareU(r, static_cast<unsigned>(h.bRearLights), e.rearLights);
 }
@@ -746,6 +978,10 @@ bool runHandlingCheck(char* codes, size_t size)
     int len = 0;
     for (size_t i = 0; i < r.codes.size() && len < static_cast<int>(size) - 6; ++i)
         len += snprintf(codes + len, size - len, i ? " %04d" : "%04d", r.codes[i]);
+#ifdef _DEBUG
+    if (!r.debug.empty() && len < static_cast<int>(size) - 1)
+        snprintf(codes + len, size - len, "%s", r.debug.c_str());
+#endif
     return r.mismatches == 0;
 }
 
@@ -782,6 +1018,36 @@ private:
     static inline bool s_ownCollisions = false;
     static inline bool s_mDown = false;
     static inline bool s_kDown = false;
+    static inline bool s_kUsedAsModifier = false;  // +/- pressed while K held: no toggle on release
+    static inline bool s_uUsedAsModifier = false;  // same for U
+    static inline bool s_sDown = false, s_dDown = false;
+
+    // A key that toggles on release, or adjusts 'value' when + / - is pressed while it is held.
+    template<class Toggle>
+    static void handleModifierKey(int key, bool& wasDown, bool& usedAsModifier, int delta,
+                                  int& value, int minValue, int maxValue, const char* format, Toggle toggle) {
+        const bool down = (GetAsyncKeyState(key) & 0x8000) != 0;
+        if (down) {
+            if (!wasDown)
+                usedAsModifier = false;
+            if (delta != 0) {
+                usedAsModifier = true;
+                if (visualsAllowed()) {
+                    value += delta;
+                    if (value < minValue) value = minValue;
+                    if (value > maxValue) value = maxValue;
+                    char msg[48];
+                    snprintf(msg, sizeof(msg), format, value);
+                    showHelp(msg);
+                }
+            }
+        }
+        else if (wasDown && !usedAsModifier && visualsAllowed()) {
+            toggle();
+        }
+        wasDown = down;
+    }
+    static inline bool s_plusDown = false, s_minusDown = false, s_addDown = false, s_subDown = false;
     static inline bool s_uDown = false;
     static inline bool s_jDown = false;
     static inline bool s_hDown = false;
@@ -821,6 +1087,7 @@ private:
     static inline std::vector<VehicleVis> s_vis;
     static inline std::vector<Sphere> s_spheres;
     static inline std::vector<Box> s_boxes;
+    static inline std::vector<RwIm3DVertex> s_vehicleMeshLines;  // collision-mesh edges of vehicles
 
     static inline bool s_gDown = false;
     static inline std::vector<SelectedObject> s_selected;
@@ -862,7 +1129,7 @@ private:
                 ++changed;
             }
             else if (!isSelected(e)) {
-                s_selected.push_back({ e, e->m_nModelIndex });
+                s_selected.push_back({ e, e->m_nModelIndex, e->m_nType == ENTITY_TYPE_BUILDING });
                 ++changed;
             }
         }
@@ -878,17 +1145,28 @@ private:
         s_objectSpheres.clear();
         s_objectBoxes.clear();
 
-        s_selected.erase(std::remove_if(s_selected.begin(), s_selected.end(),
-            [](const SelectedObject& s) { return !isSelectionValid(s); }), s_selected.end());
-
+        std::vector<RwIm3DVertex> lines;
         std::vector<Sphere> spheres;
         std::vector<Box> boxes;
-        for (const SelectedObject& s : s_selected) {
-            collectColTriangles(s.entity, s_objectLines, MAX_OBJECT_TRIANGLES);
-            collectColSpheres(s.entity, spheres);
-            s_objectSpheres.insert(s_objectSpheres.end(), spheres.begin(), spheres.end());
-            collectColBoxes(s.entity, boxes);
-            s_objectBoxes.insert(s_objectBoxes.end(), boxes.begin(), boxes.end());
+        for (SelectedObject& s : s_selected) {
+            // Refresh the cache while the entity exists: buildings once, objects every frame
+            // (they can move). The entity is only touched while it is still valid.
+            if ((!s.cached || !s.isBuilding) && isSelectionValid(s)) {
+                lines.clear();
+                collectColTriangles(s.entity, lines, MAX_OBJECT_TRIANGLES);
+                collectColSpheres(s.entity, spheres);
+                collectColBoxes(s.entity, boxes);
+                // Keep the old cache if the collision model is currently streamed out.
+                if (!lines.empty() || !spheres.empty() || !boxes.empty()) {
+                    s.lines.swap(lines);
+                    s.spheres.swap(spheres);
+                    s.boxes.swap(boxes);
+                    s.cached = true;
+                }
+            }
+            s_objectLines.insert(s_objectLines.end(), s.lines.begin(), s.lines.end());
+            s_objectSpheres.insert(s_objectSpheres.end(), s.spheres.begin(), s.spheres.end());
+            s_objectBoxes.insert(s_objectBoxes.end(), s.boxes.begin(), s.boxes.end());
         }
     }
 
@@ -964,17 +1242,50 @@ private:
             checkHandling(false);
         }
 
-        if (justPressed('K', s_kDown) && visualsAllowed()) {
-            s_showTrajectory = !s_showTrajectory;
-            showHelp(s_showTrajectory ? "Trajectory On" : "Trajectory Off");
-        }
-        if (justPressed('U', s_uDown) && visualsAllowed()) {
-            s_showCollisions = !s_showCollisions;
-            showHelp(s_showCollisions ? "Collision Spheres On" : "Collision Spheres Off");
+        // K and U toggle when released. Holding one of them and pressing + / - (main
+        // keyboard or numpad) changes a setting instead: K = trajectory thickness,
+        // U = collision wireframe opacity.
+        {
+            int delta = 0;
+            if (justPressed(VK_OEM_PLUS, s_plusDown) | justPressed(VK_ADD, s_addDown))
+                delta = +1;
+            if (justPressed(VK_OEM_MINUS, s_minusDown) | justPressed(VK_SUBTRACT, s_subDown))
+                delta = -1;
+
+            // U+S / U+D: collision style. Edges are tracked every frame; they only act while U is held.
+            const bool uHeld = (GetAsyncKeyState('U') & 0x8000) != 0;
+            const bool sPressed = justPressed('S', s_sDown);
+            const bool dPressed = justPressed('D', s_dDown);
+            if (uHeld && (sPressed || dPressed)) {
+                s_uUsedAsModifier = true;  // releasing U must not toggle the spheres
+                if (visualsAllowed()) {
+                    if (sPressed) {
+                        g_collisionSolid = !g_collisionSolid;
+                        showHelp(g_collisionSolid ? "Collision Solid" : "Collision Wireframe");
+                    }
+                    if (dPressed) {
+                        g_collisionDepthTest = !g_collisionDepthTest;
+                        showHelp(g_collisionDepthTest ? "Collision Depth Test On" : "Collision Depth Test Off");
+                    }
+                }
+            }
+
+            handleModifierKey('K', s_kDown, s_kUsedAsModifier, delta,
+                g_trajectoryWidth, 1, MAX_TRAJECTORY_WIDTH, "Trajectory thickness %d",
+                [] {
+                    s_showTrajectory = !s_showTrajectory;
+                    showHelp(s_showTrajectory ? "Trajectory On" : "Trajectory Off");
+                });
+            handleModifierKey('U', s_uDown, s_uUsedAsModifier, delta,
+                g_collisionOpacity, 1, MAX_COLLISION_OPACITY, "Collision opacity %d0%%",
+                [] {
+                    s_showCollisions = !s_showCollisions;
+                    showHelp(s_showCollisions ? "Collision Spheres On" : "Collision Spheres Off");
+                });
         }
         if (justPressed('N', s_nDown) && visualsAllowed()) {
             s_showBoxes = !s_showBoxes;
-            showHelp(s_showBoxes ? "Collision Boxes On" : "Collision Boxes Off");
+            showHelp(s_showBoxes ? "Collision Boxes/Mesh On" : "Collision Boxes/Mesh Off");
         }
         if (justPressed('M', s_mDown) && visualsAllowed()) {
             s_ownCollisions = !s_ownCollisions;
@@ -990,6 +1301,7 @@ private:
         s_vis.clear();
         s_spheres.clear();
         s_boxes.clear();
+        s_vehicleMeshLines.clear();
         if (!s_showTrajectory && !s_showCollisions && !s_showBoxes && !s_ownCollisions)
             return;
 
@@ -1018,27 +1330,60 @@ private:
             if (showBoxes) {
                 collectColBoxes(v, boxes);
                 s_boxes.insert(s_boxes.end(), boxes.begin(), boxes.end());
+                collectColTriangles(v, s_vehicleMeshLines, MAX_OBJECT_TRIANGLES);
             }
         }
     }
 
     static void draw() {
-        if (s_vis.empty() && s_spheres.empty() && s_boxes.empty()
+        if (s_vis.empty() && s_spheres.empty() && s_boxes.empty() && s_vehicleMeshLines.empty()
             && s_objectLines.empty() && s_objectSpheres.empty() && s_objectBoxes.empty())
             return;
 
         DebugRenderState state; // opaque, untextured lines; restored on return
         for (const VehicleVis& vis : s_vis)
             drawTrajectory(vis.trajectory, vis.hitsGround);
-        for (const Sphere& s : s_spheres)
-            drawSphere(s.pos, s.radius);
-        for (const Box& b : s_boxes)
-            drawBox(b);
 
+        // All spheres and boxes go into one batch (buffer reused between frames), so they
+        // are drawn in a handful of calls instead of one call per sphere/box.
+        // Collision style: optional depth test; depth is only written for fully opaque solids
+        // (transparent surfaces must not hide what is behind them).
+        const bool opaqueSolid = g_collisionSolid && g_collisionOpacity >= MAX_COLLISION_OPACITY;
+        RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)(g_collisionDepthTest ? TRUE : FALSE));
+        RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)(g_collisionDepthTest && opaqueSolid ? TRUE : FALSE));
+
+        static std::vector<RwIm3DVertex> batch;
+        batch.clear();
+        if (g_collisionSolid) {
+            for (const Sphere& s : s_spheres)
+                appendSolidSphere(batch, s.pos, s.radius);
+            for (const Sphere& s : s_objectSpheres)
+                appendSolidSphere(batch, s.pos, s.radius);
+            for (const Box& b : s_boxes)
+                appendSolidBox(batch, b);
+            for (const Box& b : s_objectBoxes)
+                appendSolidBox(batch, b);
+            applyAlpha(batch, g_collisionOpacity);
+            RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)kSolidCullMode);
+            drawTriList(batch);
+            RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+        }
+        else {
+            for (const Sphere& s : s_spheres)
+                appendSphere(batch, s.pos, s.radius);
+            for (const Sphere& s : s_objectSpheres)
+                appendSphere(batch, s.pos, s.radius);
+            for (const Box& b : s_boxes)
+                appendBox(batch, b);
+            for (const Box& b : s_objectBoxes)
+                appendBox(batch, b);
+            applyAlpha(batch, g_collisionOpacity);
+            drawLineList(batch);
+        }
+
+        applyAlpha(s_vehicleMeshLines, g_collisionOpacity);
+        applyAlpha(s_objectLines, g_collisionOpacity);
+        drawLineList(s_vehicleMeshLines);
         drawLineList(s_objectLines);
-        for (const Sphere& s : s_objectSpheres)
-            drawSphere(s.pos, s.radius);
-        for (const Box& b : s_objectBoxes)
-            drawBox(b);
     }
 } stuntVis;

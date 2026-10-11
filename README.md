@@ -14,10 +14,14 @@ Copy the file for your game into its `scripts` folder (needs an ASI loader):
 
 | Key | Action |
 |---|---|
-| K | Predicted trajectory (while airborne) on/off |
-| U | Collision spheres of tracked vehicles on/off |
-| N | Collision boxes of tracked vehicles on/off |
-| M | Collision spheres + boxes of your own vehicle on/off |
+| K | Predicted trajectory (while airborne) on/off (toggles on release) |
+| K + `+` / `-` | Hold K and press plus/minus to change the trajectory thickness (1–10) |
+| U | Collision spheres of tracked vehicles on/off (toggles on release) |
+| U + `+` / `-` | Hold U and press plus/minus to change the opacity of all collision drawing (10–100%) |
+| U + S | Switch collision spheres and boxes between wireframe and solid (shaded, back faces culled) |
+| U + D | Switch the depth test for collision drawing on/off (on = hidden behind walls) |
+| N | Collision boxes + collision mesh of tracked vehicles on/off |
+| M | Collision spheres, boxes and mesh of your own vehicle on/off |
 | J | Track / untrack a vehicle (the one you're in, or the nearest within 20 m) |
 | G | Select / deselect the objects you're touching and show their collision; G while touching nothing clears |
 | H | Run the integrity check |
