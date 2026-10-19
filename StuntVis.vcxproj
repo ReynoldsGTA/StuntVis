@@ -114,6 +114,11 @@
       <AdditionalDependencies>plugin.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <SubSystem>Windows</SubSystem>
     </Link>
+    <PostBuildEvent>
+      <Command>if not exist "$(ProjectDir)bin" mkdir "$(ProjectDir)bin"
+copy /Y "$(TargetPath)" "$(ProjectDir)bin\$(TargetFileName)"</Command>
+      <Message>Copy $(TargetFileName) to the repo bin folder</Message>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='GTASA zDebug|Win32'">
     <ClCompile>
@@ -156,6 +161,11 @@
       <AdditionalDependencies>plugin_vc.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <SubSystem>Windows</SubSystem>
     </Link>
+    <PostBuildEvent>
+      <Command>if not exist "$(ProjectDir)bin" mkdir "$(ProjectDir)bin"
+copy /Y "$(TargetPath)" "$(ProjectDir)bin\$(TargetFileName)"</Command>
+      <Message>Copy $(TargetFileName) to the repo bin folder</Message>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='GTAVC zDebug|Win32'">
     <ClCompile>

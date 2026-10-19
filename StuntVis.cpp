@@ -4,13 +4,21 @@
 //   U - toggle collision spheres of tracked vehicles;
 //       hold U and press + / - to change the opacity of all collision drawing (10-100%),
 //       U+S to switch spheres/boxes between wireframe and solid,
-//       U+D to switch the depth test of collision drawing on/off
+//       U+D to switch the depth test of wireframe collision on/off (solid is always depth tested),
+//       U+R to hide the models of the G-selected objects (only their collision is drawn)
 //   N - toggle collision boxes + collision mesh (triangles) of tracked vehicles
 //   M - toggle collision spheres, boxes and mesh of the vehicle you are driving (independent of U/N)
 //   J - track / untrack a vehicle: the one you are in, or else the nearest one (20 m).
 //   G - select / deselect the world objects your vehicle (or you, on foot) is standing on
 //       or touching, and show their collision (spheres, boxes, triangle mesh). Press G
 //       while touching nothing to clear the selection.
+//   X - (SA only) toggle the cull zones that give extra air resistance (red; yellow =
+//       the zone you are in)
+//   Y - (SA only) foliage: shown -> replaced by its shaded collision spheres/boxes -> hidden -> shown.
+//       Covers procedural grass and plants, and models flagged as tree or palm
+//       (rendering only, collision stays)
+//   F6 - (SA only) render the world without textures: every texture on stage 0 is swapped
+//       for a 1x1 white one while the scene is drawn (vertex colours and lighting stay)
 //   H - check handling data of a few vehicles against the default handling.cfg
 //       (also runs once on the first game frame; shows only numeric codes, 0000 = all OK;
 //       code table in the handling section)
@@ -34,6 +42,9 @@
 #include "CCamera.h"
 #ifdef GTASA
 #include "CCollisionData.h"
+#include "CCullZones.h"
+#include "CMenuManager.h"
+#include <windows.h>
 #else
 #include "CAutomobile.h"
 #endif
@@ -44,6 +55,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <cctype>
 #ifndef GTASA
 #include "CTreadable.h"
 #endif
@@ -71,6 +84,16 @@ Frame entityMatrix(CEntity* e)
 #else
     const CMatrix& m = e->m_placement;
     return { m.right, m.up, m.at, m.pos };
+#endif
+}
+
+// The entity's 'draw me' flag (SA: m_bIsVisible, VC SDK: m_nFlags.bIsVisible).
+void setEntityVisible(CEntity* e, bool visible)
+{
+#ifdef GTASA
+    e->m_bIsVisible = visible;
+#else
+    e->m_nFlags.bIsVisible = visible;
 #endif
 }
 
@@ -105,9 +128,28 @@ CColModel* getColModel(CEntity* e)
 // Sets plain, opaque line rendering for the duration of a scope and restores the
 // game's render states afterwards. Without this the lines inherit whatever the game
 // drew last (a texture, vertex alpha, fog), which can make them fade or vanish.
+// Sets depth test / depth write for our drawing. RenderWare caches render states and skips
+// a set that matches its cached value, but game code sometimes changes the Direct3D state
+// directly, so the cache can be wrong. Setting the opposite value first forces the real
+// state through. The depth compare is set to "less or equal" as well (it can be left at
+// another value by the game).
+void setDepthState(bool test, bool write)
+{
+    RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)(test ? FALSE : TRUE));
+    RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)(test ? TRUE : FALSE));
+    RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)(write ? FALSE : TRUE));
+    RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)(write ? TRUE : FALSE));
+    constexpr RwUInt32 D3DRS_ZFUNC_ = 23, D3DCMP_LESSEQUAL_ = 4;  // same values in D3D8 and D3D9
+#ifdef GTASA
+    RwD3D9SetRenderState(D3DRS_ZFUNC_, D3DCMP_LESSEQUAL_);
+#else
+    RwD3D8SetRenderState(D3DRS_ZFUNC_, D3DCMP_LESSEQUAL_);
+#endif
+}
+
 struct DebugRenderState {
     RwUInt32 raster = 0, vertexAlpha = 0, zWrite = 0, zTest = 0, fog = 0, srcBlend = 0, dstBlend = 0;
-    RwUInt32 lighting = 0, cullMode = 0;
+    RwUInt32 lighting = 0, cullMode = 0, zFunc = 4;
     static constexpr RwUInt32 D3DRS_LIGHTING_ = 137; // same value in D3D8 and D3D9
 
     DebugRenderState() {
@@ -135,17 +177,21 @@ struct DebugRenderState {
 #ifdef GTASA
         RwD3D9GetRenderState(D3DRS_LIGHTING_, &lighting);
         RwD3D9SetRenderState(D3DRS_LIGHTING_, FALSE);
+        RwD3D9GetRenderState(23 /*D3DRS_ZFUNC*/, &zFunc);
 #else
         RwD3D8GetRenderState(D3DRS_LIGHTING_, &lighting);
         RwD3D8SetRenderState(D3DRS_LIGHTING_, FALSE);
+        RwD3D8GetRenderState(23 /*D3DRS_ZFUNC*/, &zFunc);
 #endif
     }
 
     ~DebugRenderState() {
 #ifdef GTASA
         RwD3D9SetRenderState(D3DRS_LIGHTING_, lighting);
+        RwD3D9SetRenderState(23 /*D3DRS_ZFUNC*/, zFunc);
 #else
         RwD3D8SetRenderState(D3DRS_LIGHTING_, lighting);
+        RwD3D8SetRenderState(23 /*D3DRS_ZFUNC*/, zFunc);
 #endif
         RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)(uintptr_t)raster);
         RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)(uintptr_t)vertexAlpha);
@@ -296,8 +342,10 @@ const CVector kLightDir(0.3f, 0.4f, 0.866f);
 
 float shadeFor(const CVector& n)
 {
+    // Wrapped lighting: every face direction gets its own brightness (0.2 .. 1.0), so the
+    // faces of a box stay distinguishable even when they all face away from the light.
     const float d = n.x * kLightDir.x + n.y * kLightDir.y + n.z * kLightDir.z;
-    return 0.45f + 0.55f * (d > 0.0f ? d : 0.0f);
+    return 0.6f + 0.4f * d;
 }
 
 void pushVertex(std::vector<RwIm3DVertex>& out, const CVector& p, int r, int g, int b, float shade)
@@ -423,7 +471,10 @@ void appendBox(std::vector<RwIm3DVertex>& out, const Box& box)
 
 // Appends a solid, shaded box (6 faces, 2 triangles each) to a triangle-list batch, each
 // face wound counter-clockwise seen from outside (back faces are culled on the GPU).
-void appendSolidBox(std::vector<RwIm3DVertex>& out, const Box& box)
+// perFace: colour each face by its outward world-space normal, like a normal buffer
+// (normal * 0.5 + 0.5 as RGB, same as the collision meshes), instead of shaded r/g/b.
+void appendSolidBox(std::vector<RwIm3DVertex>& out, const Box& box, int r = 0, int g = 160, int b = 255,
+                    bool perFace = false)
 {
     // Faces as corner indices (bit 1 = max x, 2 = max y, 4 = max z), wound consistently.
     static const int faces[6][4] = {
@@ -432,33 +483,46 @@ void appendSolidBox(std::vector<RwIm3DVertex>& out, const Box& box)
         {0,1,3,2}, {4,6,7,5},   // -z, +z
     };
     const CVector centre = (box.corners[0] + box.corners[7]) * 0.5f;
-    for (const auto& f : faces) {
+    for (int fi = 0; fi < 6; ++fi) {
+        const int* f = faces[fi];
         const CVector& a = box.corners[f[0]];
         const CVector& c = box.corners[f[2]];
-        const CVector* b = &box.corners[f[1]];
+        const CVector* pb = &box.corners[f[1]];
         const CVector* d = &box.corners[f[3]];
-        CVector n = crossProduct(*b - a, *d - a);
+        CVector n = crossProduct(*pb - a, *d - a);
         const float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
         if (len > 1e-6f) n = n * (1.0f / len);
         // Reverse the face if it is wound inwards (depends on the entity's matrix), so it is
         // always counter-clockwise seen from outside.
         const CVector fc = (a + c) * 0.5f - centre;
         if (n.x * fc.x + n.y * fc.y + n.z * fc.z < 0.0f) {
-            std::swap(b, d);
+            std::swap(pb, d);
             n = n * -1.0f;
         }
-        const float s = shadeFor(n);
-        pushVertex(out, a, 0, 160, 255, s); pushVertex(out, *b, 0, 160, 255, s); pushVertex(out, c, 0, 160, 255, s);
-        pushVertex(out, a, 0, 160, 255, s); pushVertex(out, c, 0, 160, 255, s); pushVertex(out, *d, 0, 160, 255, s);
+        int fr = r, fg = g, fb = b;
+        float s = shadeFor(n);
+        if (perFace) {
+            fr = static_cast<int>((n.x * 0.5f + 0.5f) * 255.0f);
+            fg = static_cast<int>((n.y * 0.5f + 0.5f) * 255.0f);
+            fb = static_cast<int>((n.z * 0.5f + 0.5f) * 255.0f);
+            s = 1.0f;
+        }
+        pushVertex(out, a, fr, fg, fb, s); pushVertex(out, *pb, fr, fg, fb, s); pushVertex(out, c, fr, fg, fb, s);
+        pushVertex(out, a, fr, fg, fb, s); pushVertex(out, c, fr, fg, fb, s); pushVertex(out, *d, fr, fg, fb, s);
     }
 }
 
 // ---- Collision triangle meshes -----------------------------------------------
 
-// Appends the edges of an entity's collision triangles as a line list.
+// Appends the edges of an entity's collision triangles as a line list, or (solid) the
+// triangles themselves as a shaded, two-sided triangle list. With normalColours, solid
+// triangles are coloured like a normal buffer instead: world-space normal * 0.5 + 0.5 as RGB
+// (+x red, +y green, +z blue; a flat floor is light blue). The normal follows the game's own
+// collision normal (CColTrianglePlane: (c - a) x (b - a)).
 // SA stores vertices compressed (int16, 1/128 m units); VC (PC) stores plain floats.
 // Both use 8-byte triangles (3 x uint16 vertex index + surface data).
-void collectColTriangles(CEntity* e, std::vector<RwIm3DVertex>& out, size_t maxTriangles)
+void collectColTriangles(CEntity* e, std::vector<RwIm3DVertex>& out, size_t maxTriangles, bool solid = false,
+                         int cr = 60, int cg = 130, int cb = 60, bool normalColours = false)
 {
     CColModel* col = getColModel(e);
     if (!col)
@@ -501,6 +565,30 @@ void collectColTriangles(CEntity* e, std::vector<RwIm3DVertex>& out, size_t maxT
         const CVector a = toWorld(vertex(tri(static_cast<int>(i), 0)));
         const CVector b = toWorld(vertex(tri(static_cast<int>(i), 1)));
         const CVector c = toWorld(vertex(tri(static_cast<int>(i), 2)));
+        if (solid) {
+            // Winding of collision triangles is not guaranteed, so shade both sides alike.
+            CVector n = crossProduct(b - a, c - a);
+            const float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+            if (len < 1e-6f)
+                continue;
+            n = n * (1.0f / len);
+            if (normalColours) {
+                const CVector g = n * -1.0f;  // (c - a) x (b - a) = -((b - a) x (c - a))
+                const int nr = static_cast<int>((g.x * 0.5f + 0.5f) * 255.0f);
+                const int ng = static_cast<int>((g.y * 0.5f + 0.5f) * 255.0f);
+                const int nb = static_cast<int>((g.z * 0.5f + 0.5f) * 255.0f);
+                pushVertex(out, a, nr, ng, nb, 1.0f);
+                pushVertex(out, b, nr, ng, nb, 1.0f);
+                pushVertex(out, c, nr, ng, nb, 1.0f);
+                continue;
+            }
+            const float d = fabsf(n.x * kLightDir.x + n.y * kLightDir.y + n.z * kLightDir.z);
+            const float s = 0.35f + 0.65f * d;
+            pushVertex(out, a, cr, cg, cb, s);
+            pushVertex(out, b, cr, cg, cb, s);
+            pushVertex(out, c, cr, cg, cb, s);
+            continue;
+        }
         add(a); add(b);
         add(b); add(c);
         add(c); add(a);
@@ -519,6 +607,52 @@ void applyAlpha(std::vector<RwIm3DVertex>& verts, int opacityStep)
     const RwUInt32 a = static_cast<RwUInt32>(opacityStep * 255 / MAX_COLLISION_OPACITY) << 24;
     for (RwIm3DVertex& v : verts)
         v.color = (v.color & 0x00FFFFFF) | a;
+}
+
+// ---- Depth cues for solid collision ----
+// Darkens vertices with distance from the camera, scaled to the [dmin, dmax] range of what
+// is drawn this frame, so a wall behind another one is visibly darker (up to 60%).
+void distanceRange(const std::vector<RwIm3DVertex>& verts, const CVector& cam, float& dmin, float& dmax)
+{
+    for (const RwIm3DVertex& v : verts) {
+        const float dx = v.objVertex.x - cam.x, dy = v.objVertex.y - cam.y, dz = v.objVertex.z - cam.z;
+        const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d < dmin) dmin = d;
+        if (d > dmax) dmax = d;
+    }
+}
+
+void applyDepthCue(std::vector<RwIm3DVertex>& verts, const CVector& cam, float dmin, float dmax)
+{
+    const float range = dmax - dmin;
+    if (range < 0.5f)
+        return;
+    for (RwIm3DVertex& v : verts) {
+        const float dx = v.objVertex.x - cam.x, dy = v.objVertex.y - cam.y, dz = v.objVertex.z - cam.z;
+        const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        const float f = 1.0f - 0.6f * (d - dmin) / range;
+        const RwUInt32 c = v.color;
+        const RwUInt32 r = static_cast<RwUInt32>(((c >> 16) & 0xFF) * f);
+        const RwUInt32 g = static_cast<RwUInt32>(((c >> 8) & 0xFF) * f);
+        const RwUInt32 b = static_cast<RwUInt32>((c & 0xFF) * f);
+        v.color = (c & 0xFF000000) | (r << 16) | (g << 8) | b;
+    }
+}
+
+// Copies collision-mesh edges as dark outlines, nudged towards the camera so they are not
+// hidden inside the solid triangles when depth testing is on.
+void appendOutlines(std::vector<RwIm3DVertex>& out, const std::vector<RwIm3DVertex>& lines, const CVector& cam)
+{
+    for (RwIm3DVertex v : lines) {
+        const float dx = cam.x - v.objVertex.x, dy = cam.y - v.objVertex.y, dz = cam.z - v.objVertex.z;
+        const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d > 1e-3f) {
+            const float k = (0.02f + d * 0.002f) / d;
+            v.objVertex.x += dx * k; v.objVertex.y += dy * k; v.objVertex.z += dz * k;
+        }
+        v.color = 0xFF202020;
+        out.push_back(v);
+    }
 }
 
 // Draws a long triangle list in chunks (30000 is a multiple of 3).
@@ -552,8 +686,11 @@ struct SelectedObject {
     // collision out (or deletes and later recreates an object) as you move away.
     bool cached = false;
     std::vector<RwIm3DVertex> lines;
+    std::vector<RwIm3DVertex> tris;   // the same mesh as shaded triangles (solid mode)
     std::vector<Sphere> spheres;
     std::vector<Box> boxes;
+    bool hidden = false;              // its model is hidden by U+R (replace by collision)
+    CEntity* lod = nullptr;           // its low-detail stand-in, hidden along with it (SA)
 };
 
 // True if the pointer is still a live building/object of the same model.
@@ -996,12 +1133,161 @@ bool justPressed(int key, bool& wasDown)
     return pressed;
 }
 
+// ---- Model names (SA) ---------------------------------------------------------
+// The game keeps only a hash of each model name, so the names are read once from the IDE
+// files listed in data\gta.dat / data\default.dat (relative to the game folder).
+#ifdef GTASA
+namespace modelnames {
+    std::vector<std::string> names;  // by model id
+    bool loaded = false;
+
+    std::string lower(std::string s) {
+        for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        return s;
+    }
+
+    std::string trim(const std::string& s) {
+        size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    }
+
+    void readIde(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "r");
+        if (!f)
+            return;
+        char buf[512];
+        bool inModels = false;
+        while (fgets(buf, sizeof(buf), f)) {
+            if (char* hash = strchr(buf, '#')) *hash = 0;
+            const std::string line = trim(buf);
+            if (line.empty())
+                continue;
+            const std::string low = lower(line);
+            if (low == "objs" || low == "tobj" || low == "anim") { inModels = true; continue; }
+            if (line.find(',') == std::string::npos) { inModels = false; continue; }  // other section / "end"
+            if (!inModels)
+                continue;
+            const int id = atoi(line.c_str());
+            const size_t c1 = line.find(','), c2 = line.find(',', c1 + 1);
+            if (id <= 0 || id >= 30000 || c2 == std::string::npos)
+                continue;
+            if (static_cast<size_t>(id) >= names.size())
+                names.resize(id + 1);
+            names[id] = trim(line.substr(c1 + 1, c2 - c1 - 1));
+        }
+        fclose(f);
+    }
+
+    void readDat(const char* path) {
+        FILE* f = fopen(path, "r");
+        if (!f)
+            return;
+        char buf[512];
+        while (fgets(buf, sizeof(buf), f)) {
+            const std::string line = trim(buf);
+            if (line.size() > 4 && lower(line.substr(0, 4)) == "ide ")
+                readIde(trim(line.substr(4)));
+        }
+        fclose(f);
+    }
+
+    void load() {
+        if (loaded)
+            return;
+        loaded = true;
+        readDat("data\\default.dat");
+        readDat("data\\gta.dat");
+    }
+
+    const char* get(int id) {
+        load();
+        return id >= 0 && static_cast<size_t>(id) < names.size() ? names[id].c_str() : "";
+    }
+}
+#endif
+
+// ---- Untextured world (SA, Direct3D 9) -----------------------------------------
+// IDirect3DDevice9::SetTexture (vtable slot 65) is redirected. Between the game update and
+// the end of the 3D scene, a texture set on stage 0 is replaced by a 1x1 white texture, so
+// every surface shows only its vertex colour / lighting. RenderWare's own state stays as is.
+#ifdef GTASA
+namespace untextured {
+    typedef long (__stdcall* SetTextureFn)(void* device, unsigned long stage, void* texture);
+    typedef long (__stdcall* CreateTextureFn)(void* device, unsigned w, unsigned h, unsigned levels,
+        unsigned long usage, int format, int pool, void** texture, void* sharedHandle);
+    struct LockedRect { int pitch; void* bits; };
+    typedef long (__stdcall* LockRectFn)(void* texture, unsigned level, LockedRect* rect, const void* area, unsigned long flags);
+    typedef long (__stdcall* UnlockRectFn)(void* texture, unsigned level);
+
+    constexpr int SLOT_SET_TEXTURE = 65, SLOT_CREATE_TEXTURE = 23;  // IDirect3DDevice9
+    constexpr int SLOT_LOCK_RECT = 19, SLOT_UNLOCK_RECT = 20;       // IDirect3DTexture9
+    constexpr int D3DFMT_A8R8G8B8_ = 21, D3DPOOL_MANAGED_ = 1;
+
+    bool enabled = false;   // F6
+    bool inScene = false;   // between the game update and the end of the 3D scene
+    void* white = nullptr;
+    SetTextureFn original = nullptr;
+
+    void** vtable(void* com) { return *reinterpret_cast<void***>(com); }
+
+    long __stdcall setTexture(void* device, unsigned long stage, void* texture) {
+        if (enabled && inScene && stage == 0 && texture && white)
+            texture = white;
+        return original(device, stage, texture);
+    }
+
+    // Creates the white texture and redirects SetTexture (once; the device lives for the
+    // whole game, and a managed texture survives device resets).
+    bool install() {
+        if (original)
+            return true;
+        void* device = GetD3DDevice<void>();
+        if (!device)
+            return false;
+        void** vt = vtable(device);
+        void* tex = nullptr;
+        if (reinterpret_cast<CreateTextureFn>(vt[SLOT_CREATE_TEXTURE])(device, 1, 1, 1, 0,
+                D3DFMT_A8R8G8B8_, D3DPOOL_MANAGED_, &tex, nullptr) < 0 || !tex)
+            return false;
+        LockedRect r{};
+        if (reinterpret_cast<LockRectFn>(vtable(tex)[SLOT_LOCK_RECT])(tex, 0, &r, nullptr, 0) >= 0) {
+            *static_cast<unsigned int*>(r.bits) = 0xFFFFFFFF;
+            reinterpret_cast<UnlockRectFn>(vtable(tex)[SLOT_UNLOCK_RECT])(tex, 0);
+        }
+        white = tex;
+        original = reinterpret_cast<SetTextureFn>(vt[SLOT_SET_TEXTURE]);
+        DWORD old;
+        VirtualProtect(&vt[SLOT_SET_TEXTURE], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+        vt[SLOT_SET_TEXTURE] = reinterpret_cast<void*>(&setTexture);
+        VirtualProtect(&vt[SLOT_SET_TEXTURE], sizeof(void*), old, &old);
+        return true;
+    }
+
+    void beginScene() {
+        inScene = enabled && !FrontEndMenuManager.m_bMenuActive;
+    }
+
+    void endScene() {
+        if (!inScene)
+            return;
+        inScene = false;
+        // RenderWare skips SetTexture when it thinks a texture is already bound; clearing
+        // its cache makes the next (HUD) texture really reach the device again.
+        RwD3D9SetTexture(nullptr, 0);
+    }
+}
+#endif
+
 } // namespace
 
 class StuntVis {
 public:
     StuntVis() {
         Events::gameProcessEvent.Add(process);
+#ifdef GTASA
+        Events::gameProcessEvent.Add(untextured::beginScene);  // after process(): the scene is drawn next
+        Events::drawingEvent.Add(untextured::endScene);         // before draw(): our overlay and the HUD keep textures
+#endif
         Events::drawingEvent.Add(draw);
     }
 
@@ -1064,9 +1350,9 @@ private:
         s_handlingOk = runHandlingCheck(s_handlingCodes, sizeof(s_handlingCodes));
         s_lastHandlingCheck = CTimer::m_snTimeInMilliseconds;
         if (!s_handlingOk) {
-            s_showTrajectory = s_showCollisions = s_showBoxes = s_ownCollisions = false;
+            s_showTrajectory = s_showCollisions = s_showBoxes = s_ownCollisions = s_showCullZones = false;
             s_tracked.clear();
-            s_selected.clear();
+            clearSelection();
         }
         // Show the result when asked (start-up, H) or when the state changes.
         if (announce || wasOk != s_handlingOk)
@@ -1092,9 +1378,251 @@ private:
     static inline bool s_gDown = false;
     static inline std::vector<SelectedObject> s_selected;
     static inline std::vector<RwIm3DVertex> s_objectLines;  // triangle edges of selected objects
+    static inline std::vector<RwIm3DVertex> s_objectTris;   // shaded triangles of selected objects (solid mode)
+    static inline std::vector<RwIm3DVertex> s_vehicleMeshTris;  // shaded collision mesh of vehicles (solid mode)
+    static inline bool s_replaceSelected = false;           // U+R: hide the models of selected objects
+    static inline bool s_rDown = false;
+
+    // Shows a selected object's own model again (if we hid it and it still exists).
+    static void restoreSelected(SelectedObject& s) {
+        if (s.hidden && isSelectionValid(s))
+            setEntityVisible(s.entity, true);
+        if (s.lod && CPools::ms_pBuildingPool->IsObjectValid(reinterpret_cast<CBuilding*>(s.lod)))
+            setEntityVisible(s.lod, true);
+        s.lod = nullptr;
+        s.hidden = false;
+    }
+
+    static void clearSelection() {
+        for (SelectedObject& s : s_selected)
+            restoreSelected(s);
+        s_selected.clear();
+    }
     static inline std::vector<Sphere> s_objectSpheres;
     static inline std::vector<Box> s_objectBoxes;
     static constexpr size_t MAX_OBJECT_TRIANGLES = 20000;  // per object, keeps big meshes affordable
+
+    // ---- Cull zones with extra air resistance (SA) ----
+    static inline bool s_xDown = false;
+    static inline bool s_showCullZones = false;
+    static inline std::vector<RwIm3DVertex> s_cullZoneLines;
+
+#ifdef GTASA
+    // A zone is a parallelogram in x/y (corner + two edge vectors), extruded from z1 to z2.
+    static bool zoneContains(const CZoneDef& z, const CVector& p) {
+        const float dx = p.x - z.x1, dy = p.y - z.y1;
+        const float d1 = dx * z.x2 + dy * z.y2, d2 = dx * z.x3 + dy * z.y3;
+        return d1 >= 0.0f && d1 <= float(z.x2 * z.x2 + z.y2 * z.y2)
+            && d2 >= 0.0f && d2 <= float(z.x3 * z.x3 + z.y3 * z.y3)
+            && p.z >= z.z1 && p.z <= z.z2;
+    }
+
+    static void appendZone(std::vector<RwIm3DVertex>& out, const CZoneDef& z, int r, int g, int b) {
+        const float x[4] = { float(z.x1), float(z.x1 + z.x2), float(z.x1 + z.x2 + z.x3), float(z.x1 + z.x3) };
+        const float y[4] = { float(z.y1), float(z.y1 + z.y2), float(z.y1 + z.y2 + z.y3), float(z.y1 + z.y3) };
+        auto line = [&](float ax, float ay, float az, float bx, float by, float bz) {
+            RwIm3DVertex v[2]{};
+            RwIm3DVertexSetPos(&v[0], ax, ay, az);
+            RwIm3DVertexSetPos(&v[1], bx, by, bz);
+            RwIm3DVertexSetRGBA(&v[0], r, g, b, 255);
+            RwIm3DVertexSetRGBA(&v[1], r, g, b, 255);
+            out.push_back(v[0]); out.push_back(v[1]);
+        };
+        for (int i = 0; i < 4; ++i) {
+            const int j = (i + 1) % 4;
+            line(x[i], y[i], z.z1, x[j], y[j], z.z1);  // bottom
+            line(x[i], y[i], z.z2, x[j], y[j], z.z2);  // top
+            line(x[i], y[i], z.z1, x[i], y[i], z.z2);  // vertical edge
+        }
+    }
+#endif
+
+    static void updateCullZones() {
+        s_cullZoneLines.clear();
+#ifdef GTASA
+        if (!s_showCullZones)
+            return;
+        CPed* player = FindPlayerPed();
+        const CVector p = player ? player->GetPosition() : CVector(0.0f, 0.0f, -1000.0f);
+        auto add = [&](const CCullZone* zones, int count) {
+            for (int i = 0; i < count; ++i) {
+                if (!(zones[i].flags & ATTRZONE_EXTRAAIRRESISTANCE))
+                    continue;
+                const bool inside = zoneContains(zones[i].zoneDef, p);
+                appendZone(s_cullZoneLines, zones[i].zoneDef, 255, inside ? 255 : 40, 40);
+            }
+        };
+        add(CCullZones::aAttributeZones, CCullZones::NumAttributeZones);
+        add(CCullZones::aTunnelAttributeZones, CCullZones::NumTunnelAttributeZones);
+#endif
+    }
+
+    // ---- Hide foliage (SA) ----
+    static inline bool s_yDown = false;
+    static inline bool s_f6Down = false;
+    static inline bool s_hideFoliage = false;
+    static inline bool s_foliageAsBoxes = false;   // draw collision spheres/boxes in place of hidden foliage
+    static inline std::vector<Box> s_foliageBoxes;
+    static inline std::vector<Sphere> s_foliageSpheres;
+    static inline std::vector<RwIm3DVertex> s_foliageTris;  // solid collision-mesh triangles
+    static constexpr float FOLIAGE_BOX_RANGE = 200.0f;
+    static inline unsigned int s_lastFoliageScan = 0;
+
+#ifdef GTASA
+    // CPlantMgr::Render draws the procedural grass/plants (plants.dat); a 'ret' at its
+    // start skips it.
+    static constexpr int PLANTMGR_RENDER = 0x5DBAE0;
+    static inline unsigned char s_plantRenderByte = 0;
+    static inline bool s_plantsPatched = false;
+
+    static void setPlantsHidden(bool hidden) {
+        if (hidden == s_plantsPatched)
+            return;
+        if (hidden) {
+            s_plantRenderByte = patch::GetUChar(PLANTMGR_RENDER);
+            patch::SetUChar(PLANTMGR_RENDER, 0xC3);  // ret
+        }
+        else
+            patch::SetUChar(PLANTMGR_RENDER, s_plantRenderByte);
+        s_plantsPatched = hidden;
+    }
+
+    // Foliage per model id, built once: IDE special type tree/palm, or a vegetation name
+    // (many SA trees, bushes and hedges have no tree flag), then the overrides from
+    // scripts\StuntVis_foliage.txt (one model id per line; "-id" excludes, "#" comments).
+    static inline std::vector<signed char> s_foliageById;  // 1 = foliage, 0 = not, -1 = not decided yet
+
+    static bool vegetationName(const std::string& name) {
+        static const char* include[] = { "tree", "palm", "bush", "hedge", "shrub", "cedar", "cypress",
+            "pine", "plant", "fern", "cactus", "leaf", "leaves", "flower", "weed", "reed", "ivy", "joshua",
+            "birch", "willow", "sapling", "tallgrass", "grasspatch", "procgrass", "foliage", "fir", "elm",
+            "oak", "bamboo", "yucca", "agave", "vine" };
+        // Names that contain the words above but are not plants (street, fire hydrant, ...).
+        static const char* exclude[] = { "street", "fire", "lamp", "light", "sign", "hydrant", "bin",
+            "fnce", "fence", "house", "hose", "gate", "wall", "door", "shop", "garage", "bridge", "pipe",
+            "pot", "planter", "plantbox", "pol_", "dirt", "esc", "scape" };
+        const std::string low = modelnames::lower(name);
+        bool match = false;
+        for (const char* s : include) if (low.find(s) != std::string::npos) { match = true; break; }
+        if (!match)
+            return false;
+        for (const char* s : exclude) if (low.find(s) != std::string::npos) return false;
+        return true;
+    }
+
+    static void loadFoliageOverrides() {
+        FILE* f = fopen("scripts\\StuntVis_foliage.txt", "r");
+        if (!f)
+            return;
+        char buf[128];
+        while (fgets(buf, sizeof(buf), f)) {
+            if (char* hash = strchr(buf, '#')) *hash = 0;
+            const char* p = buf;
+            while (*p == ' ' || *p == '\t') ++p;
+            const bool exclude = *p == '-';
+            if (exclude || *p == '+') ++p;
+            const int id = atoi(p);
+            if (id > 0 && static_cast<size_t>(id) < s_foliageById.size())
+                s_foliageById[id] = exclude ? 0 : 1;
+        }
+        fclose(f);
+    }
+
+    static bool isFoliage(const CEntity* e) {
+        const int id = e->m_nModelIndex;
+        if (s_foliageById.empty()) {
+            s_foliageById.assign(30000, -1);
+            loadFoliageOverrides();
+        }
+        if (id < 0 || static_cast<size_t>(id) >= s_foliageById.size())
+            return false;
+        if (s_foliageById[id] < 0) {
+            const CBaseModelInfo* mi = CModelInfo::ms_modelInfoPtrs[id];
+            const unsigned int special = mi ? mi->nSpecialType : 0;
+            s_foliageById[id] = (special == 1 /*TREE*/ || special == 2 /*PALM*/
+                                 || vegetationName(modelnames::get(id))) ? 1 : 0;
+        }
+        return s_foliageById[id] == 1;
+    }
+
+    // One pass over buildings, dummies and objects: hides foliage (Y). 'restore' makes it
+    // visible again (after the mode is turned off).
+    template <class Pool>
+    static void applyVisibilityPool(Pool* pool, bool restore) {
+        if (!pool)
+            return;
+        for (int i = 0; i < pool->m_nSize; ++i) {
+            if (pool->IsFreeSlotAtIndex(i))
+                continue;
+            CEntity* e = reinterpret_cast<CEntity*>(&pool->m_pObjects[i]);
+            if (!isFoliage(e))
+                continue;
+            if (s_hideFoliage) {
+                setEntityVisible(e, false);
+                if (s_foliageAsBoxes)
+                    addFoliageCollision(e);
+            }
+            else if (restore)
+                setEntityVisible(e, true);
+        }
+    }
+
+    // The collision spheres, boxes and mesh of a hidden foliage entity (the same data G shows).
+    static void addFoliageCollision(CEntity* e) {
+        const CVector d = e->GetPosition() - s_foliageCam;
+        if (d.x * d.x + d.y * d.y + d.z * d.z > FOLIAGE_BOX_RANGE * FOLIAGE_BOX_RANGE)
+            return;
+        static std::vector<Sphere> spheres;
+        static std::vector<Box> boxes;
+        collectColSpheres(e, spheres);
+        collectColBoxes(e, boxes);
+        collectColTriangles(e, s_foliageTris, MAX_OBJECT_TRIANGLES, true);
+        s_foliageSpheres.insert(s_foliageSpheres.end(), spheres.begin(), spheres.end());
+        s_foliageBoxes.insert(s_foliageBoxes.end(), boxes.begin(), boxes.end());
+    }
+
+    static inline CVector s_foliageCam;
+
+    static void applyVisibility(bool restore) {
+        s_foliageBoxes.clear();
+        s_foliageSpheres.clear();
+        s_foliageTris.clear();
+        s_foliageCam = cameraPosition();
+        setPlantsHidden(s_hideFoliage);
+        applyVisibilityPool(CPools::ms_pBuildingPool, restore);
+        applyVisibilityPool(CPools::ms_pDummyPool, restore);
+        applyVisibilityPool(CPools::ms_pObjectPool, restore);  // includes procedural objects (procobj.dat)
+        s_lastFoliageScan = CTimer::m_snTimeInMilliseconds;
+    }
+#endif
+
+    // Y cycles: shown -> collision -> hidden -> shown.
+    static void toggleFoliage() {
+#ifdef GTASA
+        if (!s_hideFoliage)          { s_hideFoliage = true;  s_foliageAsBoxes = true;  }
+        else if (s_foliageAsBoxes)   { s_foliageAsBoxes = false; }
+        else                         { s_hideFoliage = false; }
+        applyVisibility(!s_hideFoliage);
+        if (s_hideFoliage && s_foliageAsBoxes) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Foliage Collision (%u boxes, %u spheres)",
+                     static_cast<unsigned>(s_foliageBoxes.size()), static_cast<unsigned>(s_foliageSpheres.size()));
+            showHelp(msg);
+        }
+        else
+            showHelp(!s_hideFoliage ? "Foliage Shown" : "Foliage Hidden");
+#else
+        showHelp("Foliage: SA only");
+#endif
+    }
+
+    // Map sections stream in and out while you move, so new entities get the same treatment.
+    static void updateFoliage() {
+#ifdef GTASA
+        if (s_hideFoliage && CTimer::m_snTimeInMilliseconds - s_lastFoliageScan > 250)
+            applyVisibility(false);
+#endif
+    }
 
     static void toggleObjectSelection() {
         CPed* player = FindPlayerPed();
@@ -1109,7 +1637,7 @@ private:
             touchedEntities(player, nullptr, touched);
 
         if (touched.empty()) {
-            s_selected.clear();
+            clearSelection();
             showHelp("Object selection cleared");
             return;
         }
@@ -1124,6 +1652,8 @@ private:
         int changed = 0;
         for (CEntity* e : touched) {
             if (allSelected) {
+                for (SelectedObject& s : s_selected)
+                    if (s.entity == e) restoreSelected(s);
                 s_selected.erase(std::remove_if(s_selected.begin(), s_selected.end(),
                     [e](const SelectedObject& s) { return s.entity == e; }), s_selected.end());
                 ++changed;
@@ -1134,18 +1664,30 @@ private:
             }
         }
 
-        char msg[96];
-        snprintf(msg, sizeof(msg), "%s %d object(s) (%d selected)", allSelected ? "Deselected" : "Selected",
-                 changed, static_cast<int>(s_selected.size()));
-        showHelp(msg);
+        // Model id (and name, SA) of what you touch, to find models Y misses.
+        std::string msg = std::string(allSelected ? "Deselected " : "Selected ") + std::to_string(changed)
+            + " object(s) (" + std::to_string(s_selected.size()) + " selected):";
+        int listed = 0;
+        for (CEntity* e : touched) {
+            if (++listed > 4) { msg += " ..."; break; }
+            msg += " " + std::to_string(e->m_nModelIndex);
+#ifdef GTASA
+            const char* name = modelnames::get(e->m_nModelIndex);
+            if (*name) msg += std::string(" ") + name;
+            if (isFoliage(e)) msg += " (foliage)";
+#endif
+            if (listed < static_cast<int>(touched.size()) && listed < 4) msg += ",";
+        }
+        showHelp(msg.c_str());
     }
 
     static void updateSelectedObjects() {
         s_objectLines.clear();
         s_objectSpheres.clear();
         s_objectBoxes.clear();
+        s_objectTris.clear();
 
-        std::vector<RwIm3DVertex> lines;
+        std::vector<RwIm3DVertex> lines, tris;
         std::vector<Sphere> spheres;
         std::vector<Box> boxes;
         for (SelectedObject& s : s_selected) {
@@ -1153,18 +1695,39 @@ private:
             // (they can move). The entity is only touched while it is still valid.
             if ((!s.cached || !s.isBuilding) && isSelectionValid(s)) {
                 lines.clear();
+                tris.clear();
                 collectColTriangles(s.entity, lines, MAX_OBJECT_TRIANGLES);
+                collectColTriangles(s.entity, tris, MAX_OBJECT_TRIANGLES, true, 0, 0, 0, true);
                 collectColSpheres(s.entity, spheres);
                 collectColBoxes(s.entity, boxes);
                 // Keep the old cache if the collision model is currently streamed out.
                 if (!lines.empty() || !spheres.empty() || !boxes.empty()) {
                     s.lines.swap(lines);
+                    s.tris.swap(tris);
                     s.spheres.swap(spheres);
                     s.boxes.swap(boxes);
                     s.cached = true;
                 }
             }
+            // U+R: hide the object's own (textured) model, so only its collision is drawn.
+            // Only the drawing is affected; the collision stays.
+            if (isSelectionValid(s)) {
+                if (s_replaceSelected) {
+                    setEntityVisible(s.entity, false);
+                    s.hidden = true;
+#ifdef GTASA
+                    // Otherwise the renderer draws the LOD model in its place.
+                    if (CEntity* lod = s.entity->m_pLod) {
+                        setEntityVisible(lod, false);
+                        s.lod = lod;
+                    }
+#endif
+                }
+                else
+                    restoreSelected(s);
+            }
             s_objectLines.insert(s_objectLines.end(), s.lines.begin(), s.lines.end());
+            s_objectTris.insert(s_objectTris.end(), s.tris.begin(), s.tris.end());
             s_objectSpheres.insert(s_objectSpheres.end(), s.spheres.begin(), s.spheres.end());
             s_objectBoxes.insert(s_objectBoxes.end(), s.boxes.begin(), s.boxes.end());
         }
@@ -1256,6 +1819,14 @@ private:
             const bool uHeld = (GetAsyncKeyState('U') & 0x8000) != 0;
             const bool sPressed = justPressed('S', s_sDown);
             const bool dPressed = justPressed('D', s_dDown);
+            const bool rPressed = justPressed('R', s_rDown);
+            if (uHeld && rPressed) {
+                s_uUsedAsModifier = true;
+                if (visualsAllowed()) {
+                    s_replaceSelected = !s_replaceSelected;
+                    showHelp(s_replaceSelected ? "Selected objects: collision only" : "Selected objects: model shown");
+                }
+            }
             if (uHeld && (sPressed || dPressed)) {
                 s_uUsedAsModifier = true;  // releasing U must not toggle the spheres
                 if (visualsAllowed()) {
@@ -1298,10 +1869,38 @@ private:
             toggleObjectSelection();
         updateSelectedObjects();
 
+        if (justPressed('X', s_xDown) && visualsAllowed()) {
+#ifdef GTASA
+            s_showCullZones = !s_showCullZones;
+            showHelp(s_showCullZones ? "Air Resistance Zones On" : "Air Resistance Zones Off");
+#else
+            showHelp("Air resistance zones: SA only");
+#endif
+        }
+        updateCullZones();
+
+        if (justPressed('Y', s_yDown))
+            toggleFoliage();
+        updateFoliage();
+
+        if (justPressed(VK_F6, s_f6Down)) {
+#ifdef GTASA
+            if (untextured::install()) {
+                untextured::enabled = !untextured::enabled;
+                showHelp(untextured::enabled ? "Textures Off" : "Textures On");
+            }
+            else
+                showHelp("Textures: no Direct3D 9 device");
+#else
+            showHelp("Textures off: SA only");
+#endif
+        }
+
         s_vis.clear();
         s_spheres.clear();
         s_boxes.clear();
         s_vehicleMeshLines.clear();
+        s_vehicleMeshTris.clear();
         if (!s_showTrajectory && !s_showCollisions && !s_showBoxes && !s_ownCollisions)
             return;
 
@@ -1331,26 +1930,47 @@ private:
                 collectColBoxes(v, boxes);
                 s_boxes.insert(s_boxes.end(), boxes.begin(), boxes.end());
                 collectColTriangles(v, s_vehicleMeshLines, MAX_OBJECT_TRIANGLES);
+                if (g_collisionSolid)
+                    collectColTriangles(v, s_vehicleMeshTris, MAX_OBJECT_TRIANGLES, true, 0, 0, 0, true);
             }
         }
     }
 
     static void draw() {
         if (s_vis.empty() && s_spheres.empty() && s_boxes.empty() && s_vehicleMeshLines.empty()
-            && s_objectLines.empty() && s_objectSpheres.empty() && s_objectBoxes.empty())
+            && s_vehicleMeshTris.empty()
+            && s_objectLines.empty() && s_objectSpheres.empty() && s_objectBoxes.empty()
+            && s_cullZoneLines.empty() && s_foliageBoxes.empty() && s_foliageSpheres.empty()
+            && s_foliageTris.empty())
             return;
 
         DebugRenderState state; // opaque, untextured lines; restored on return
+
+        // Collision of hidden foliage: opaque, shaded, depth tested and written like real geometry.
+        if (!s_foliageBoxes.empty() || !s_foliageSpheres.empty() || !s_foliageTris.empty()) {
+            static std::vector<RwIm3DVertex> foliage;
+            foliage.clear();
+            for (const Sphere& s : s_foliageSpheres)
+                appendSolidSphere(foliage, s.pos, s.radius);
+            for (const Box& b : s_foliageBoxes)
+                appendSolidBox(foliage, b, 40, 150, 40);
+            setDepthState(true, true);
+            RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)kSolidCullMode);
+            drawTriList(foliage);
+            RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+            drawTriList(s_foliageTris);  // two-sided: mesh winding is not guaranteed
+            setDepthState(false, false);
+        }
         for (const VehicleVis& vis : s_vis)
             drawTrajectory(vis.trajectory, vis.hitsGround);
 
         // All spheres and boxes go into one batch (buffer reused between frames), so they
         // are drawn in a handful of calls instead of one call per sphere/box.
-        // Collision style: optional depth test; depth is only written for fully opaque solids
-        // (transparent surfaces must not hide what is behind them).
-        const bool opaqueSolid = g_collisionSolid && g_collisionOpacity >= MAX_COLLISION_OPACITY;
-        RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)(g_collisionDepthTest ? TRUE : FALSE));
-        RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)(g_collisionDepthTest && opaqueSolid ? TRUE : FALSE));
+        // Collision style: solid mode always depth tests and writes depth (also when partly
+        // transparent), so collision surfaces hide each other correctly. The U+D depth test
+        // switch only applies to wireframes.
+        const bool depthTest = g_collisionSolid || g_collisionDepthTest;
+        setDepthState(depthTest, g_collisionSolid);
 
         static std::vector<RwIm3DVertex> batch;
         batch.clear();
@@ -1360,13 +1980,47 @@ private:
             for (const Sphere& s : s_objectSpheres)
                 appendSolidSphere(batch, s.pos, s.radius);
             for (const Box& b : s_boxes)
-                appendSolidBox(batch, b);
+                appendSolidBox(batch, b, 0, 0, 0, true);
             for (const Box& b : s_objectBoxes)
-                appendSolidBox(batch, b);
+                appendSolidBox(batch, b, 0, 0, 0, true);
+
+            // Depth cue: darker with distance, over the range of everything drawn.
+            const CVector cam = cameraPosition();
+            float dmin = 1e9f, dmax = 0.0f;
+            distanceRange(batch, cam, dmin, dmax);
+            distanceRange(s_vehicleMeshTris, cam, dmin, dmax);
+            distanceRange(s_objectTris, cam, dmin, dmax);
+            applyDepthCue(batch, cam, dmin, dmax);
+            applyDepthCue(s_vehicleMeshTris, cam, dmin, dmax);
+            applyDepthCue(s_objectTris, cam, dmin, dmax);
+
             applyAlpha(batch, g_collisionOpacity);
             RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)kSolidCullMode);
             drawTriList(batch);
             RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+            // Collision meshes: two-sided, their winding is not guaranteed.
+            applyAlpha(s_vehicleMeshTris, g_collisionOpacity);
+            applyAlpha(s_objectTris, g_collisionOpacity);
+            drawTriList(s_vehicleMeshTris);
+            drawTriList(s_objectTris);
+
+            // Dark triangle outlines on the meshes.
+            static std::vector<RwIm3DVertex> outlines;
+            outlines.clear();
+            if (!s_vehicleMeshTris.empty())
+                appendOutlines(outlines, s_vehicleMeshLines, cam);
+            if (!s_objectTris.empty())
+                appendOutlines(outlines, s_objectLines, cam);
+            // Box edges too.
+            static std::vector<RwIm3DVertex> boxEdges;
+            boxEdges.clear();
+            for (const Box& b : s_boxes)
+                appendBox(boxEdges, b);
+            for (const Box& b : s_objectBoxes)
+                appendBox(boxEdges, b);
+            appendOutlines(outlines, boxEdges, cam);
+            applyAlpha(outlines, g_collisionOpacity);
+            drawLineList(outlines);
         }
         else {
             for (const Sphere& s : s_spheres)
@@ -1381,9 +2035,15 @@ private:
             drawLineList(batch);
         }
 
-        applyAlpha(s_vehicleMeshLines, g_collisionOpacity);
-        applyAlpha(s_objectLines, g_collisionOpacity);
-        drawLineList(s_vehicleMeshLines);
-        drawLineList(s_objectLines);
+        if (!g_collisionSolid) {
+            applyAlpha(s_vehicleMeshLines, g_collisionOpacity);
+            applyAlpha(s_objectLines, g_collisionOpacity);
+            drawLineList(s_vehicleMeshLines);
+            drawLineList(s_objectLines);
+        }
+
+        // Cull zones: always on top, fixed opacity.
+        setDepthState(false, false);
+        drawLineList(s_cullZoneLines);
     }
 } stuntVis;

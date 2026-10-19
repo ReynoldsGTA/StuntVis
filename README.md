@@ -18,13 +18,19 @@ Copy the file for your game into its `scripts` folder (needs an ASI loader):
 | K + `+` / `-` | Hold K and press plus/minus to change the trajectory thickness (1–10) |
 | U | Collision spheres of tracked vehicles on/off (toggles on release) |
 | U + `+` / `-` | Hold U and press plus/minus to change the opacity of all collision drawing (10–100%) |
-| U + S | Switch collision spheres and boxes between wireframe and solid (shaded, back faces culled) |
-| U + D | Switch the depth test for collision drawing on/off (on = hidden behind walls) |
+| U + S | Switch collision between wireframe and solid: shaded spheres; boxes (back faces culled) and collision meshes coloured by normal, with dark edges and darker with distance (normal-buffer colours: +x red, +y green, +z blue, flat floor light blue) |
+| U + D | Switch the depth test for wireframe collision on/off (on = hidden behind walls); solid collision is always depth tested |
+| U + R | Hide the models of the objects selected with G, so only their collision is drawn (collision itself unchanged) |
 | N | Collision boxes + collision mesh of tracked vehicles on/off |
 | M | Collision spheres, boxes and mesh of your own vehicle on/off |
 | J | Track / untrack a vehicle (the one you're in, or the nearest within 20 m) |
-| G | Select / deselect the objects you're touching and show their collision; G while touching nothing clears |
-| H | Run the integrity check |
+| G | Select / deselect the objects you're touching and show their collision; G while touching nothing clears. The message lists the model id (and name, SA) of what you touch, marked `(foliage)` if Y treats it as foliage. |
+| X | Cull zones with extra air resistance on/off (SA only; red, yellow = the zone you're in) |
+| Y | Foliage (grass, plants, trees, palms, bushes, hedges): shown → its shaded collision → hidden → shown (SA only; collision stays) |
+
+Foliage for Y is found by the tree/palm flag and by model name (read from the game's IDE files).
+To add or exclude models, create `scripts\StuntVis_foliage.txt` with one model id per line
+(`-id` excludes, `#` starts a comment); it is read when the game starts.
 
 The integrity check runs at start-up, every 5 seconds and on H. It shows `0000` when everything is fine,
 otherwise error codes, and locks all visualisations until it passes again.
